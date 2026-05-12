@@ -10,6 +10,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAX_MESSAGES_PER_PROMPT,
+  OBSERVATIONAL_MEMORY_ENABLED,
   ONECLI_URL,
   POLL_INTERVAL,
   TIMEZONE,
@@ -49,6 +50,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { observeConversation } from './observational-memory.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   restoreRemoteControl,
@@ -429,6 +431,20 @@ async function runAgent(
         'Container agent error',
       );
       return 'error';
+    }
+
+    // Observational Memory: fire-and-forget background pass to compress this
+    // conversation's new turns into dated observations for next session's
+    // context. Off by default; opt-in via OBSERVATIONAL_MEMORY=on. Errors are
+    // swallowed inside observeConversation — they must never affect the user
+    // response or the agent loop.
+    if (OBSERVATIONAL_MEMORY_ENABLED) {
+      observeConversation(group.folder, chatJid).catch((err) => {
+        logger.warn(
+          { group: group.name, err: err instanceof Error ? err.message : err },
+          'Observer pass threw unexpectedly',
+        );
+      });
     }
 
     return 'success';
