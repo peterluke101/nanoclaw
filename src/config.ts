@@ -63,6 +63,23 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
 );
 
+// Observational Memory (v1). Off by default — opt in by setting the env to
+// 'on' (any other value is treated as off, including missing). Calls `claude`
+// CLI on the host after each successful agent run, so requires Claude Code
+// CLI installed and authenticated on the host. See src/observational-memory.ts.
+export const OBSERVATIONAL_MEMORY_ENABLED =
+  (process.env.OBSERVATIONAL_MEMORY || '').toLowerCase() === 'on';
+export const OBSERVATIONAL_MEMORY_MODEL =
+  process.env.OBSERVATIONAL_MEMORY_MODEL || 'claude-haiku-4-5';
+export const OBSERVATIONAL_MEMORY_MIN_MESSAGES = Math.max(
+  1,
+  parseInt(process.env.OBSERVATIONAL_MEMORY_MIN_MESSAGES || '3', 10) || 3,
+);
+export const OBSERVATIONAL_MEMORY_TIMEOUT_MS = Math.max(
+  5000,
+  parseInt(process.env.OBSERVATIONAL_MEMORY_TIMEOUT_MS || '60000', 10) || 60000,
+);
+
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

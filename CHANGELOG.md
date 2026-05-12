@@ -4,6 +4,10 @@ All notable changes to NanoClaw will be documented in this file.
 
 For detailed release notes, see the [full changelog on the documentation site](https://docs.nanoclaw.dev/changelog).
 
+## [Unreleased]
+
+- Added Observational Memory v1 (Observer pass). After each successful agent run, a fire-and-forget background pass compresses new conversation turns into dated factual bullets via a short `claude --print` Haiku call and appends them to `groups/<folder>/observations.md`. The group template imports the file via `@observations.md` so future sessions get dense, time-aware recall. Off by default — opt in with `OBSERVATIONAL_MEMORY=on` (also: `OBSERVATIONAL_MEMORY_MODEL`, `OBSERVATIONAL_MEMORY_MIN_MESSAGES`, `OBSERVATIONAL_MEMORY_TIMEOUT_MS`). Reuses the user's `claude` CLI auth — no API key required when running on a Claude subscription.
+
 ## [1.2.36] - 2026-03-26
 
 - [BREAKING] Replaced pino logger with built-in logger. WhatsApp users must re-merge the WhatsApp fork to pick up the Baileys logger compatibility fix: `git fetch whatsapp main && git merge whatsapp/main`. If the `whatsapp` remote is not configured: `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git`.

@@ -47,6 +47,12 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
+### Observational memory (auto)
+
+If `observations.md` exists in this folder, it contains a time-ordered, model-compressed log of durable facts from past conversations. Treat it as authoritative recall — newer entries override older ones. Hand-edit freely; the Observer never deletes user edits.
+
+@observations.md
+
 ## Message Formatting
 
 Format messages based on the channel you're responding to. Check your group folder name:
