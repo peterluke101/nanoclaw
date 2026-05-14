@@ -80,6 +80,101 @@ let messageLoopRunning = false;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
+// --- Unified channel mirror state ---
+//
+// jidToPrimary maps both primary AND subscriber JIDs to the primary JID of
+// their registered group. Rebuilt on every change to registeredGroups.
+//
+// recentSourceJid remembers, per primary JID, which JID the most recent
+// inbound arrived on. The orchestrator uses this to route the agent's reply
+// back to the same channel the user used; fan-outs go to the rest.
+const jidToPrimary = new Map<string, string>();
+const recentSourceJid = new Map<string, string>();
+
+function rebuildJidIndex(): void {
+  jidToPrimary.clear();
+  for (const [primary, group] of Object.entries(registeredGroups)) {
+    jidToPrimary.set(primary, primary);
+    for (const sub of group.subscriberJids ?? []) {
+      const existing = jidToPrimary.get(sub);
+      if (existing && existing !== primary) {
+        logger.warn(
+          { jid: sub, existingPrimary: existing, conflictingPrimary: primary },
+          'unified-channel-mirror: subscriber JID claimed by two groups — first one wins',
+        );
+        continue;
+      }
+      jidToPrimary.set(sub, primary);
+    }
+  }
+}
+
+/**
+ * Friendly channel name for the inbound-mirror prefix.
+ * "mc-chat" → "Mission Control"; "telegram" → "Telegram"; etc.
+ */
+function friendlyChannelName(channelName: string | undefined): string {
+  if (!channelName) return 'Other';
+  if (channelName === 'mc-chat') return 'Mission Control';
+  // Capitalize first letter — works for 'telegram', 'whatsapp', 'slack', etc.
+  return channelName.charAt(0).toUpperCase() + channelName.slice(1);
+}
+
+/**
+ * Implements ChannelOpts.mirrorSend: deliver `text` to `toJid` via whichever
+ * channel owns it, bypassing the inbound pipeline entirely. Used for both
+ * inbound user-message mirrors and agent-reply fan-outs.
+ *
+ * Never calls storeMessage (no agent-history pollution). Never triggers
+ * onMessage on the destination channel (no echo loop).
+ */
+async function mirrorSend(toJid: string, text: string): Promise<void> {
+  const channel = findChannel(channels, toJid);
+  if (!channel) {
+    logger.warn(
+      { toJid },
+      'unified-channel-mirror: no channel owns JID, dropping mirror',
+    );
+    return;
+  }
+  if (!channel.isConnected()) {
+    logger.warn(
+      { toJid, channel: channel.name },
+      'unified-channel-mirror: channel disconnected, dropping mirror',
+    );
+    return;
+  }
+  try {
+    await channel.sendMessage(toJid, text);
+  } catch (err) {
+    logger.error(
+      { toJid, channel: channel.name, err },
+      'unified-channel-mirror: send failed',
+    );
+  }
+}
+
+/**
+ * Fan-out helper. Given the primary JID and the JID we already sent to, deliver
+ * `text` to every other JID subscribed to this group via mirrorSend.
+ * Fire-and-forget; mirror failures must not block the source send.
+ */
+function fanOutToOtherSubscribers(
+  primaryJid: string,
+  excludeJid: string,
+  text: string,
+): void {
+  const group = registeredGroups[primaryJid];
+  if (!group) return;
+  const allJids = [primaryJid, ...(group.subscriberJids ?? [])];
+  for (const jid of allJids) {
+    if (jid === excludeJid) continue;
+    mirrorSend(jid, text).catch((err) =>
+      logger.warn({ jid, err }, 'mirror fan-out failed (continuing)'),
+    );
+  }
+}
+
 const onecli = new OneCLI({ url: ONECLI_URL });
 
 function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
@@ -112,6 +207,7 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  rebuildJidIndex();
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -158,6 +254,7 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
+  rebuildJidIndex();
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
@@ -214,6 +311,166 @@ export function _setRegisteredGroups(
   groups: Record<string, RegisteredGroup>,
 ): void {
   registeredGroups = groups;
+  rebuildJidIndex();
+}
+
+/** @internal - exported for testing the mirror routing */
+export function _onInboundForTest(chatJid: string, msg: NewMessage): void {
+  channelOnMessage(chatJid, msg);
+}
+
+/** @internal - exported for testing the mirror routing */
+export function _getRecentSourceJid(primaryJid: string): string | undefined {
+  return recentSourceJid.get(primaryJid);
+}
+
+/** @internal - exported so tests can clear stale source state between cases */
+export function _resetRecentSourceJid(): void {
+  recentSourceJid.clear();
+}
+
+/** @internal - exported so tests can install stub channels for mirror testing */
+export function _setChannelsForTest(stubs: Channel[]): void {
+  channels.length = 0;
+  for (const ch of stubs) channels.push(ch);
+}
+
+/**
+ * Handle inbound /remote-control* commands. Only effective in the main group.
+ * Module-level so the channelOpts.onMessage handler can call it without
+ * closure capture.
+ */
+async function handleRemoteControl(
+  command: string,
+  chatJid: string,
+  msg: NewMessage,
+): Promise<void> {
+  const group = registeredGroups[chatJid];
+  if (!group?.isMain) {
+    logger.warn(
+      { chatJid, sender: msg.sender },
+      'Remote control rejected: not main group',
+    );
+    return;
+  }
+
+  const channel = findChannel(channels, chatJid);
+  if (!channel) return;
+
+  if (command === '/remote-control') {
+    const result = await startRemoteControl(
+      msg.sender,
+      chatJid,
+      process.cwd(),
+    );
+    if (result.ok) {
+      await channel.sendMessage(chatJid, result.url);
+    } else {
+      await channel.sendMessage(
+        chatJid,
+        `Remote Control failed: ${result.error}`,
+      );
+    }
+  } else {
+    const result = stopRemoteControl();
+    if (result.ok) {
+      await channel.sendMessage(chatJid, 'Remote Control session ended.');
+    } else {
+      await channel.sendMessage(chatJid, result.error);
+    }
+  }
+}
+
+/**
+ * Module-level inbound handler. All channels deliver here via
+ * `channelOpts.onMessage`. Responsibilities:
+ *   1. Intercept remote-control commands before storage.
+ *   2. Apply sender allowlist (drop mode).
+ *   3. Resolve the inbound JID to its group's primary JID
+ *      (unified-channel-mirror). Inbound on a subscriber JID gets rewritten
+ *      to the primary so memory unifies; the original JID is preserved on
+ *      `msg.source_jid` and in `recentSourceJid` so the agent reply can be
+ *      routed back through the right channel.
+ *   4. Store the (possibly rewritten) message.
+ *   5. Fan-out the inbound to every OTHER subscriber via mirrorSend so Peter
+ *      sees his own message reflected on the other surfaces (e.g. typing in
+ *      the dock shows up in Telegram with the `📥 [Mission Control]` prefix).
+ */
+function channelOnMessage(chatJid: string, msg: NewMessage): void {
+  // Remote control commands — intercept before storage. They are addressed
+  // to the channel's own JID, never via a subscriber/mirror, so we can act on
+  // the raw chatJid before rewriting.
+  const trimmed = msg.content.trim();
+  if (trimmed === '/remote-control' || trimmed === '/remote-control-end') {
+    handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
+      logger.error({ err, chatJid }, 'Remote control command error'),
+    );
+    return;
+  }
+
+  // Resolve to primary JID. If the inbound is on a subscriber JID, rewrite
+  // the message's chat_jid to the primary so memory and DB queries unify.
+  // If not registered under any JID, leave as-is (storeMessage is still safe
+  // — getMessagesSince will simply not find it via any registered group).
+  const primaryJid = jidToPrimary.get(chatJid) ?? chatJid;
+  if (primaryJid !== chatJid) {
+    msg = { ...msg, chat_jid: primaryJid, source_jid: chatJid };
+    logger.debug(
+      { source: chatJid, primary: primaryJid, id: msg.id },
+      'unified-channel-mirror: rewriting subscriber inbound to primary',
+    );
+  } else {
+    // Record the source explicitly even when chat_jid matches primary, so
+    // downstream code can rely on source_jid being set consistently.
+    msg = { ...msg, source_jid: chatJid };
+  }
+
+  // Sender allowlist drop mode: discard messages from denied senders before
+  // storing. Uses the primary JID for the allowlist lookup so an admin can
+  // configure allowlists once per group, regardless of which channel the
+  // message arrived on.
+  if (
+    !msg.is_from_me &&
+    !msg.is_bot_message &&
+    registeredGroups[primaryJid]
+  ) {
+    const cfg = loadSenderAllowlist();
+    if (
+      shouldDropMessage(primaryJid, cfg) &&
+      !isSenderAllowed(primaryJid, msg.sender, cfg)
+    ) {
+      if (cfg.logDenied) {
+        logger.debug(
+          { chatJid: primaryJid, sender: msg.sender },
+          'sender-allowlist: dropping message (drop mode)',
+        );
+      }
+      return;
+    }
+  }
+
+  storeMessage(msg);
+
+  // Track source for the next agent reply dispatch. Only when the group is
+  // registered (otherwise there's no agent run coming).
+  const group = registeredGroups[primaryJid];
+  if (group) {
+    recentSourceJid.set(primaryJid, chatJid);
+  }
+
+  // Fan-out the inbound to other subscribers (and the primary, if the source
+  // was a subscriber). Only when the message is from a real user — never
+  // mirror is_from_me or is_bot_message inbounds (those are echoes from the
+  // platform itself and would loop).
+  if (group && !msg.is_from_me && !msg.is_bot_message) {
+    const subs = group.subscriberJids ?? [];
+    if (subs.length > 0) {
+      const sourceChannel = findChannel(channels, chatJid);
+      const friendly = friendlyChannelName(sourceChannel?.name);
+      const prefixed = `📥 [${friendly}]\n${msg.content}`;
+      fanOutToOtherSubscribers(primaryJid, chatJid, prefixed);
+    }
+  }
 }
 
 /**
@@ -224,11 +481,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const group = registeredGroups[chatJid];
   if (!group) return true;
 
-  const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+  // Source-routing for the agent reply: dispatch to whichever JID the most
+  // recent inbound arrived on, then mirror to the other subscribed JIDs.
+  // Falls back to the primary when no source has been recorded (e.g. an
+  // agent-initiated message before any user input).
+  const replyTargetJid = recentSourceJid.get(chatJid) ?? chatJid;
+  const replyChannel = findChannel(channels, replyTargetJid);
+  if (!replyChannel) {
+    logger.warn(
+      { chatJid, replyTargetJid },
+      'No channel owns reply target JID, skipping messages',
+    );
     return true;
   }
+  // Typing indicators still address the primary JID's owning channel — they
+  // are channel-local UX, not part of the mirror.
+  const primaryChannel = findChannel(channels, chatJid) ?? replyChannel;
 
   const isMainGroup = group.isMain === true;
 
@@ -281,7 +549,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  await primaryChannel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -296,7 +564,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        // Dispatch to the source channel first (releases the dock's pending
+        // SSE without extra latency from fan-out), then mirror to all OTHER
+        // subscribed JIDs (primary ∪ subscribers, minus source).
+        await replyChannel.sendMessage(replyTargetJid, text);
+        fanOutToOtherSubscribers(chatJid, replyTargetJid, text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -312,7 +584,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  await primaryChannel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -608,78 +880,9 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Handle /remote-control and /remote-control-end commands
-  async function handleRemoteControl(
-    command: string,
-    chatJid: string,
-    msg: NewMessage,
-  ): Promise<void> {
-    const group = registeredGroups[chatJid];
-    if (!group?.isMain) {
-      logger.warn(
-        { chatJid, sender: msg.sender },
-        'Remote control rejected: not main group',
-      );
-      return;
-    }
-
-    const channel = findChannel(channels, chatJid);
-    if (!channel) return;
-
-    if (command === '/remote-control') {
-      const result = await startRemoteControl(
-        msg.sender,
-        chatJid,
-        process.cwd(),
-      );
-      if (result.ok) {
-        await channel.sendMessage(chatJid, result.url);
-      } else {
-        await channel.sendMessage(
-          chatJid,
-          `Remote Control failed: ${result.error}`,
-        );
-      }
-    } else {
-      const result = stopRemoteControl();
-      if (result.ok) {
-        await channel.sendMessage(chatJid, 'Remote Control session ended.');
-      } else {
-        await channel.sendMessage(chatJid, result.error);
-      }
-    }
-  }
-
   // Channel callbacks (shared by all channels)
   const channelOpts = {
-    onMessage: (chatJid: string, msg: NewMessage) => {
-      // Remote control commands — intercept before storage
-      const trimmed = msg.content.trim();
-      if (trimmed === '/remote-control' || trimmed === '/remote-control-end') {
-        handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
-          logger.error({ err, chatJid }, 'Remote control command error'),
-        );
-        return;
-      }
-
-      // Sender allowlist drop mode: discard messages from denied senders before storing
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
-        const cfg = loadSenderAllowlist();
-        if (
-          shouldDropMessage(chatJid, cfg) &&
-          !isSenderAllowed(chatJid, msg.sender, cfg)
-        ) {
-          if (cfg.logDenied) {
-            logger.debug(
-              { chatJid, sender: msg.sender },
-              'sender-allowlist: dropping message (drop mode)',
-            );
-          }
-          return;
-        }
-      }
-      storeMessage(msg);
-    },
+    onMessage: channelOnMessage,
     onChatMetadata: (
       chatJid: string,
       timestamp: string,
@@ -688,6 +891,7 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    mirrorSend,
   };
 
   // Create and connect all registered channels.

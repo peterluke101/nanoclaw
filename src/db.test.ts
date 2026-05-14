@@ -9,6 +9,8 @@ import {
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
+  getRegisteredGroup,
+  getRegisteredGroupByAnyJid,
   getTaskById,
   setRegisteredGroup,
   storeChatMetadata,
@@ -648,5 +650,98 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- RegisteredGroup subscriber_jids round-trip ---
+
+describe('registered group subscriber_jids', () => {
+  it('defaults to empty array when not provided', () => {
+    setRegisteredGroup('tg:111', {
+      name: 'Solo',
+      folder: 'telegram_solo',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['tg:111'].subscriberJids).toEqual([]);
+  });
+
+  it('persists subscriber_jids through set/get round-trip', () => {
+    setRegisteredGroup('tg:222', {
+      name: 'Unified',
+      folder: 'telegram_unified',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      subscriberJids: ['mc-chat:dashboard', 'slack:C123'],
+    });
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['tg:222'].subscriberJids).toEqual([
+      'mc-chat:dashboard',
+      'slack:C123',
+    ]);
+  });
+
+  it('getRegisteredGroup returns subscriber_jids', () => {
+    setRegisteredGroup('tg:333', {
+      name: 'Single sub',
+      folder: 'telegram_single',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      subscriberJids: ['mc-chat:dashboard'],
+    });
+
+    const group = getRegisteredGroup('tg:333');
+    expect(group).toBeDefined();
+    expect(group!.subscriberJids).toEqual(['mc-chat:dashboard']);
+  });
+});
+
+// --- getRegisteredGroupByAnyJid ---
+
+describe('getRegisteredGroupByAnyJid', () => {
+  it('resolves by primary JID', () => {
+    setRegisteredGroup('tg:444', {
+      name: 'Unified',
+      folder: 'telegram_unified',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      subscriberJids: ['mc-chat:dashboard'],
+    });
+
+    const found = getRegisteredGroupByAnyJid('tg:444');
+    expect(found).toBeDefined();
+    expect(found!.jid).toBe('tg:444');
+    expect(found!.folder).toBe('telegram_unified');
+  });
+
+  it('resolves by subscriber JID, returning primary as the row key', () => {
+    setRegisteredGroup('tg:555', {
+      name: 'Unified',
+      folder: 'telegram_unified2',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      subscriberJids: ['mc-chat:dashboard'],
+    });
+
+    const found = getRegisteredGroupByAnyJid('mc-chat:dashboard');
+    expect(found).toBeDefined();
+    expect(found!.jid).toBe('tg:555'); // canonical primary, not the lookup key
+    expect(found!.folder).toBe('telegram_unified2');
+    expect(found!.subscriberJids).toContain('mc-chat:dashboard');
+  });
+
+  it('returns undefined for an unknown JID', () => {
+    setRegisteredGroup('tg:666', {
+      name: 'Solo',
+      folder: 'telegram_solo2',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    expect(getRegisteredGroupByAnyJid('mc-chat:somethingelse')).toBeUndefined();
+    expect(getRegisteredGroupByAnyJid('tg:99999')).toBeUndefined();
   });
 });

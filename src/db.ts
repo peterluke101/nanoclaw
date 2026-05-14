@@ -157,6 +157,157 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* columns already exist */
   }
+
+  // Add subscriber_jids column for the unified-channel-mirror feature.
+  // A registered group can be addressable by additional JIDs beyond its primary;
+  // inbound on any subscriber JID gets rewritten to the primary so memory unifies.
+  // Stored as JSON-encoded string[] (default '[]' = no subscribers).
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN subscriber_jids TEXT NOT NULL DEFAULT '[]'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // One-shot data fix for Peter's existing install: collapse the standalone
+  // mc-chat:dashboard registered group into tg:6951928213 as a subscriber.
+  // This is idempotent — it only fires when the legacy row still exists.
+  // Future installs won't trigger this (no mc-chat:dashboard row to merge).
+  migrateMcChatIntoTelegramSubscriber(database);
+}
+
+/**
+ * Idempotent: merges a standalone mc-chat:dashboard registered_groups row
+ * into tg:6951928213 as a subscriber JID, then deletes the mc-chat row.
+ *
+ * Safe to run on every boot:
+ *   - if mc-chat:dashboard row is already gone → no-op
+ *   - if tg:6951928213 doesn't exist → no-op (Peter is on a different setup)
+ *   - if the merge has already happened → no-op (subscriber already present)
+ *
+ * The mc-dashboard group folder is NOT moved or deleted — it stays on disk
+ * for Peter to archive manually. After the merge, the primary group folder
+ * (telegram_main) serves all mc-chat traffic.
+ */
+function migrateMcChatIntoTelegramSubscriber(
+  database: Database.Database,
+): void {
+  const MC_JID = 'mc-chat:dashboard';
+  const TG_PRIMARY_JID = 'tg:6951928213';
+
+  type RowLite = {
+    jid: string;
+    folder: string;
+    requires_trigger: number | null;
+    is_main: number | null;
+    subscriber_jids: string | null;
+  };
+  let mcRow: RowLite | undefined;
+  let tgRow: RowLite | undefined;
+  try {
+    mcRow = database
+      .prepare(
+        'SELECT jid, folder, requires_trigger, is_main, subscriber_jids FROM registered_groups WHERE jid = ?',
+      )
+      .get(MC_JID) as RowLite | undefined;
+    tgRow = database
+      .prepare(
+        'SELECT jid, folder, requires_trigger, is_main, subscriber_jids FROM registered_groups WHERE jid = ?',
+      )
+      .get(TG_PRIMARY_JID) as RowLite | undefined;
+  } catch {
+    // table missing or schema mismatch — nothing to do
+    return;
+  }
+
+  // Already merged: mc-chat row absent, tg row already lists the subscriber.
+  if (!mcRow && tgRow) {
+    let subs: string[] = [];
+    try {
+      subs = tgRow.subscriber_jids ? JSON.parse(tgRow.subscriber_jids) : [];
+    } catch {
+      subs = [];
+    }
+    if (!subs.includes(MC_JID)) {
+      subs.push(MC_JID);
+      database
+        .prepare(
+          'UPDATE registered_groups SET subscriber_jids = ? WHERE jid = ?',
+        )
+        .run(JSON.stringify(subs), TG_PRIMARY_JID);
+      logger.info(
+        { primary: TG_PRIMARY_JID, added: MC_JID },
+        'unified-channel-mirror: added mc-chat as subscriber on existing tg row',
+      );
+    }
+    return;
+  }
+
+  if (!mcRow) return; // neither row exists — nothing to migrate
+  if (!tgRow) {
+    // mc-chat row exists but Telegram isn't registered. Don't auto-migrate —
+    // there's no primary to merge into. Log so Peter notices.
+    logger.warn(
+      { mcJid: MC_JID, expectedPrimary: TG_PRIMARY_JID },
+      'unified-channel-mirror: mc-chat row found but expected Telegram primary is not registered — skipping merge',
+    );
+    return;
+  }
+
+  // Both rows exist — merge. Combine the most-permissive of each side's
+  // settings so behaviors don't silently regress:
+  //   - is_main: OR (if either side was main, the merged group is main)
+  //   - requires_trigger: AND (if either side was triggerless, merged is
+  //     triggerless — otherwise dock messages without "@trigger" would be
+  //     silently dropped, violating AC1).
+  // The Telegram row's folder/name/trigger are preserved; the mc-chat folder
+  // is left orphaned on disk for manual archive.
+  let subs: string[] = [];
+  try {
+    subs = tgRow.subscriber_jids ? JSON.parse(tgRow.subscriber_jids) : [];
+  } catch {
+    subs = [];
+  }
+  if (!subs.includes(MC_JID)) subs.push(MC_JID);
+
+  const mergedIsMain =
+    (tgRow.is_main ?? 0) === 1 || (mcRow.is_main ?? 0) === 1 ? 1 : 0;
+  // requires_trigger defaults to 1 when null (per schema DEFAULT 1)
+  const tgReq = tgRow.requires_trigger === null ? 1 : tgRow.requires_trigger;
+  const mcReq = mcRow.requires_trigger === null ? 1 : mcRow.requires_trigger;
+  const mergedRequiresTrigger = tgReq === 0 || mcReq === 0 ? 0 : 1;
+
+  const tx = database.transaction(() => {
+    database
+      .prepare(
+        'UPDATE registered_groups SET subscriber_jids = ?, is_main = ?, requires_trigger = ? WHERE jid = ?',
+      )
+      .run(
+        JSON.stringify(subs),
+        mergedIsMain,
+        mergedRequiresTrigger,
+        TG_PRIMARY_JID,
+      );
+    database.prepare('DELETE FROM registered_groups WHERE jid = ?').run(MC_JID);
+  });
+  tx();
+
+  logger.info(
+    {
+      primary: TG_PRIMARY_JID,
+      primaryFolder: tgRow.folder,
+      mergedJid: MC_JID,
+      orphanedFolder: mcRow.folder,
+      mergedIsMain,
+      mergedRequiresTrigger,
+      tgIsMainBefore: tgRow.is_main ?? 0,
+      tgRequiresTriggerBefore: tgReq,
+      mcIsMain: mcRow.is_main ?? 0,
+      mcRequiresTrigger: mcReq,
+    },
+    'unified-channel-mirror: merged mc-chat:dashboard into Telegram primary as subscriber; orphan folder left on disk for manual archive',
+  );
 }
 
 export function initDatabase(): void {
@@ -594,33 +745,31 @@ export function getAllSessions(): Record<string, string> {
 
 // --- Registered group accessors ---
 
-export function getRegisteredGroup(
-  jid: string,
-): (RegisteredGroup & { jid: string }) | undefined {
-  const row = db
-    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
-    .get(jid) as
-    | {
-        jid: string;
-        name: string;
-        folder: string;
-        trigger_pattern: string;
-        added_at: string;
-        container_config: string | null;
-        requires_trigger: number | null;
-        is_main: number | null;
-      }
-    | undefined;
-  if (!row) return undefined;
-  if (!isValidGroupFolder(row.folder)) {
-    logger.warn(
-      { jid: row.jid, folder: row.folder },
-      'Skipping registered group with invalid folder',
-    );
-    return undefined;
+type RegisteredGroupRow = {
+  jid: string;
+  name: string;
+  folder: string;
+  trigger_pattern: string;
+  added_at: string;
+  container_config: string | null;
+  requires_trigger: number | null;
+  is_main: number | null;
+  subscriber_jids: string | null;
+};
+
+function parseSubscriberJids(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((s): s is string => typeof s === 'string');
+  } catch {
+    return [];
   }
+}
+
+function rowToGroup(row: RegisteredGroupRow): RegisteredGroup {
   return {
-    jid: row.jid,
     name: row.name,
     folder: row.folder,
     trigger: row.trigger_pattern,
@@ -631,7 +780,57 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    subscriberJids: parseSubscriberJids(row.subscriber_jids),
   };
+}
+
+export function getRegisteredGroup(
+  jid: string,
+): (RegisteredGroup & { jid: string }) | undefined {
+  const row = db
+    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
+    .get(jid) as RegisteredGroupRow | undefined;
+  if (!row) return undefined;
+  if (!isValidGroupFolder(row.folder)) {
+    logger.warn(
+      { jid: row.jid, folder: row.folder },
+      'Skipping registered group with invalid folder',
+    );
+    return undefined;
+  }
+  return { jid: row.jid, ...rowToGroup(row) };
+}
+
+/**
+ * Look up a registered group by its primary JID OR any of its subscriber JIDs.
+ * Returns the canonical row (keyed by primary JID).
+ *
+ * Used by the unified-channel-mirror feature: inbound on `mc-chat:dashboard`
+ * resolves to the group whose primary JID is `tg:...` and lists `mc-chat:...`
+ * as a subscriber.
+ */
+export function getRegisteredGroupByAnyJid(
+  jid: string,
+): (RegisteredGroup & { jid: string }) | undefined {
+  // Fast path: try primary first.
+  const direct = getRegisteredGroup(jid);
+  if (direct) return direct;
+
+  // Slow path: scan rows whose subscriber_jids JSON contains the JID.
+  // SQLite has no JSON contains operator without the JSON1 extension, so we
+  // filter in Node. Registered groups are small (single-digit count), so this
+  // is fine.
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
+  for (const row of rows) {
+    if (!isValidGroupFolder(row.folder)) continue;
+    const subs = parseSubscriberJids(row.subscriber_jids);
+    if (subs.includes(jid)) {
+      return { jid: row.jid, ...rowToGroup(row) };
+    }
+  }
+  return undefined;
 }
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
@@ -639,8 +838,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, subscriber_jids)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -650,20 +849,14 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
     group.isMain ? 1 : 0,
+    JSON.stringify(group.subscriberJids ?? []),
   );
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
-  const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    trigger_pattern: string;
-    added_at: string;
-    container_config: string | null;
-    requires_trigger: number | null;
-    is_main: number | null;
-  }>;
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
     if (!isValidGroupFolder(row.folder)) {
@@ -673,18 +866,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       );
       continue;
     }
-    result[row.jid] = {
-      name: row.name,
-      folder: row.folder,
-      trigger: row.trigger_pattern,
-      added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
-      requiresTrigger:
-        row.requires_trigger === null ? undefined : row.requires_trigger === 1,
-      isMain: row.is_main === 1 ? true : undefined,
-    };
+    result[row.jid] = rowToGroup(row);
   }
   return result;
 }
