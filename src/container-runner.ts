@@ -43,6 +43,8 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  /** Optional model override for per-task model routing */
+  model?: string;
 }
 
 export interface ContainerOutput {
@@ -246,11 +248,17 @@ async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentIdentifier?: string,
+  model?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Per-task model routing: inject model override if specified
+  if (model) {
+    args.push('-e', `MAIN_AGENT_MODEL=${model}`);
+  }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
@@ -315,6 +323,7 @@ export async function runContainerAgent(
     mounts,
     containerName,
     agentIdentifier,
+    input.model,
   );
 
   logger.debug(

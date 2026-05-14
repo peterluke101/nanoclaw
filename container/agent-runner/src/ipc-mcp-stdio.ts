@@ -124,6 +124,12 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       .describe(
         'Optional bash script to run before waking the agent. Script must output JSON on the last line of stdout: { "wakeAgent": boolean, "data"?: any }. If wakeAgent is false, the agent is not called. Test your script with bash -c "..." before scheduling.',
       ),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        'Model override for this task (e.g., "claude-haiku-4-5", "claude-sonnet-4-5"). Omit to use the default model.',
+      ),
   },
   async (args) => {
     // Validate schedule_value before writing IPC
@@ -199,6 +205,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       context_mode: args.context_mode || 'group',
       targetJid,
       createdBy: groupFolder,
+      model: args.model || undefined,
       timestamp: new Date().toISOString(),
     };
 

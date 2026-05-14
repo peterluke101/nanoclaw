@@ -84,6 +84,8 @@ export interface ScheduledTask {
   last_result: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
+  /** Optional model override (e.g. "claude-haiku-4-5"). Null = use default. */
+  model?: string | null;
 }
 
 export interface TaskRunLog {
