@@ -356,6 +356,120 @@ describe('McChatChannel', () => {
       expect(text).toContain('channel shutting down');
     });
   });
+
+  describe('dock-offline buffer (GET /chat/pending)', () => {
+    it('returns empty messages when buffer is empty', async () => {
+      await withChannel(makeOpts(), async (_ch, baseUrl) => {
+        const res = await fetch(`${baseUrl}/chat/pending`, {
+          headers: { Authorization: `Bearer ${SECRET}` },
+        });
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { messages: unknown[] };
+        expect(body.messages).toEqual([]);
+      });
+    });
+
+    it('buffers sendMessage when no pending SSE is open and returns it on the next /chat/pending', async () => {
+      await withChannel(makeOpts(), async (channel, baseUrl) => {
+        await channel.sendMessage(JID, 'first');
+        await channel.sendMessage(JID, '📥 [Telegram]\nsecond');
+
+        const res = await fetch(`${baseUrl}/chat/pending`, {
+          headers: { Authorization: `Bearer ${SECRET}` },
+        });
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as {
+          messages: Array<{ text: string; ts: string }>;
+        };
+        expect(body.messages.map((m) => m.text)).toEqual([
+          'first',
+          '📥 [Telegram]\nsecond',
+        ]);
+        // Each entry has a usable ISO timestamp
+        for (const m of body.messages) {
+          expect(new Date(m.ts).toISOString()).toBe(m.ts);
+        }
+      });
+    });
+
+    it('drains the buffer atomically — second call returns empty', async () => {
+      await withChannel(makeOpts(), async (channel, baseUrl) => {
+        await channel.sendMessage(JID, 'one');
+        const r1 = await (
+          await fetch(`${baseUrl}/chat/pending`, {
+            headers: { Authorization: `Bearer ${SECRET}` },
+          })
+        ).json();
+        expect((r1 as { messages: unknown[] }).messages).toHaveLength(1);
+
+        const r2 = await (
+          await fetch(`${baseUrl}/chat/pending`, {
+            headers: { Authorization: `Bearer ${SECRET}` },
+          })
+        ).json();
+        expect((r2 as { messages: unknown[] }).messages).toEqual([]);
+      });
+    });
+
+    it('does not buffer when a pending SSE is open (the SSE consumes it instead)', async () => {
+      const onMessage = vi.fn();
+      const opts = makeOpts({ onMessage });
+      await withChannel(opts, async (channel, baseUrl) => {
+        const pending = fetch(`${baseUrl}/chat`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${SECRET}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ conversationId: 'c1', message: 'hello' }),
+        });
+        await waitFor(() => onMessage.mock.calls.length > 0, 2000);
+
+        // Reply while SSE is open — releases the pending response, not the buffer.
+        await channel.sendMessage(JID, 'reply');
+        await pending;
+
+        const r = await (
+          await fetch(`${baseUrl}/chat/pending`, {
+            headers: { Authorization: `Bearer ${SECRET}` },
+          })
+        ).json();
+        expect((r as { messages: unknown[] }).messages).toEqual([]);
+      });
+    });
+
+    it('evicts oldest when buffer exceeds 100 entries', async () => {
+      await withChannel(makeOpts(), async (channel, baseUrl) => {
+        for (let i = 0; i < 105; i++) {
+          await channel.sendMessage(JID, `msg-${i}`);
+        }
+        const body = (await (
+          await fetch(`${baseUrl}/chat/pending`, {
+            headers: { Authorization: `Bearer ${SECRET}` },
+          })
+        ).json()) as { messages: Array<{ text: string }> };
+        expect(body.messages).toHaveLength(100);
+        // Oldest 5 evicted: buffer holds msg-5 .. msg-104.
+        expect(body.messages[0].text).toBe('msg-5');
+        expect(body.messages[99].text).toBe('msg-104');
+      });
+    });
+
+    it('reports buffered count on /health', async () => {
+      await withChannel(makeOpts(), async (channel, baseUrl) => {
+        await channel.sendMessage(JID, 'a');
+        await channel.sendMessage(JID, 'b');
+        const body = (await (
+          await fetch(`${baseUrl}/health`, {
+            headers: { Authorization: `Bearer ${SECRET}` },
+          })
+        ).json()) as { ok: boolean; queued: number; buffered: number };
+        expect(body.ok).toBe(true);
+        expect(body.buffered).toBe(2);
+      });
+    });
+  });
+
 });
 
 // --- helpers ---
