@@ -24,11 +24,24 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# gh wrapper: auto-loads GH_TOKEN from group secrets file so agents can use
+# GitHub CLI without manually exporting the token each time.
+RUN printf '#!/bin/bash\nif [ -f /workspace/group/secrets/github_pat.txt ]; then\n  export GH_TOKEN=$(cat /workspace/group/secrets/github_pat.txt)\nfi\nexec /usr/bin/gh "$@"\n' > /usr/local/bin/gh && chmod +x /usr/local/bin/gh
 
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
