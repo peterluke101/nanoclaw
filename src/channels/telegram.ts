@@ -22,6 +22,28 @@ export interface TelegramChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+
+/**
+ * Preprocess outbound text for Telegram.
+ *
+ * Triple-backtick code blocks render in Telegram iOS with a "<\/>" code-viewer
+ * button instead of a direct copy button. Single-line commands are converted to
+ * inline code (single backtick) so users can long-press to copy directly from
+ * the chat view. Multi-line blocks keep their pre-block format but lose the
+ * language specifier to reduce Telegram's auto-labelling.
+ */
+function formatForTelegram(text: string): string {
+  return text.replace(/```([a-zA-Z0-9_+.-]*)\n?([\s\S]*?)```/g, (_, _lang, code) => {
+    const trimmed = code.trim();
+    if (!trimmed.includes('\n')) {
+      // Single-line: inline code — long-pressable copy, no </> viewer
+      return '`' + trimmed + '`';
+    }
+    // Multi-line: plain pre-block (no language label)
+    return '```\n' + trimmed + '\n```';
+  });
+}
+
 /**
  * Send a message with Telegram Markdown parse mode, falling back to plain text.
  * Claude's output naturally matches Telegram's Markdown v1 format:
@@ -33,15 +55,16 @@ async function sendTelegramMessage(
   text: string,
   options: { message_thread_id?: number } = {},
 ): Promise<void> {
+  const formatted = formatForTelegram(text);
   try {
-    await api.sendMessage(chatId, text, {
+    await api.sendMessage(chatId, formatted, {
       ...options,
       parse_mode: 'Markdown',
     });
   } catch (err) {
     // Fallback: send as plain text if Markdown parsing fails
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
-    await api.sendMessage(chatId, text, options);
+    await api.sendMessage(chatId, formatted, options);
   }
 }
 
@@ -90,7 +113,10 @@ export class TelegramChannel implements Channel {
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const resp = await fetch(fileUrl);
       if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
