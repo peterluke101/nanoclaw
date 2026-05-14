@@ -141,6 +141,41 @@ describe('McChatChannel', () => {
       });
     });
 
+    it('accepts when mc-chat:dashboard is a subscriber of another primary (unified channel mirror)', async () => {
+      // After the unified-channel-mirror migration, the standalone
+      // mc-chat:dashboard row is removed and the JID lives in subscriber_jids
+      // on the Telegram primary. /chat must still accept the POST.
+      const onMessage = vi.fn();
+      const opts = makeOpts({
+        onMessage,
+        registeredGroups: () => ({
+          'tg:6951928213': {
+            name: 'Peter',
+            folder: 'telegram_main',
+            trigger: '@Andy',
+            added_at: new Date().toISOString(),
+            isMain: true,
+            subscriberJids: ['mc-chat:dashboard'],
+          },
+        }),
+      });
+      await withChannel(opts, async (channel, baseUrl) => {
+        const pending = fetch(`${baseUrl}/chat`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${SECRET}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ conversationId: 'cx', message: 'hello via subscriber' }),
+        });
+        // onMessage was invoked → request accepted, SSE pending
+        await waitFor(() => onMessage.mock.calls.length > 0, 2000);
+        await channel.sendMessage(JID, 'ack');
+        const res = await pending;
+        expect(res.status).toBe(200); // SSE established
+      });
+    });
+
     it('rejects empty messages', async () => {
       await withChannel(makeOpts(), async (_ch, baseUrl) => {
         const res = await fetch(`${baseUrl}/chat`, {

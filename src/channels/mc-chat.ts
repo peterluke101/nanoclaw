@@ -55,7 +55,7 @@ import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import { Channel, NewMessage } from '../types.js';
+import { Channel, NewMessage, RegisteredGroup } from '../types.js';
 
 const DEFAULT_PORT = 54173;
 const JID = 'mc-chat:dashboard';
@@ -135,6 +135,21 @@ export class McChatChannel implements Channel {
     this.secret = secret;
     this.port = port;
     this.opts = opts;
+  }
+
+  /**
+   * Find the registered group that serves the mc-chat JID, whether as the
+   * primary key or as a subscriber (unified channel mirror). Returns
+   * undefined if no group claims it.
+   */
+  private findGroupForMcChat(): RegisteredGroup | undefined {
+    const all = this.opts.registeredGroups();
+    const direct = all[JID];
+    if (direct) return direct;
+    for (const group of Object.values(all)) {
+      if (group.subscriberJids?.includes(JID)) return group;
+    }
+    return undefined;
   }
 
   async connect(): Promise<void> {
@@ -246,10 +261,10 @@ export class McChatChannel implements Channel {
       return;
     }
 
-    // Confirm a registered group exists for this JID.
-    // If not, fail fast with a clear instruction — the SKILL.md walks the user
-    // through registration.
-    const group = this.opts.registeredGroups()[JID];
+    // Confirm a registered group serves this JID — either as the primary or
+    // as a subscriber (unified channel mirror). Fail fast with a clear
+    // instruction otherwise.
+    const group = this.findGroupForMcChat();
     if (!group) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(
@@ -365,7 +380,7 @@ export class McChatChannel implements Channel {
       return;
     }
 
-    const group = this.opts.registeredGroups()[JID];
+    const group = this.findGroupForMcChat();
     if (!group) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'mc-chat JID not registered' }));
