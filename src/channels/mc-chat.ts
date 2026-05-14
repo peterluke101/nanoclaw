@@ -63,6 +63,11 @@ const HEARTBEAT_MS = 5000;
 const PENDING_TIMEOUT_MS = 5 * 60 * 1000; // 5 min — covers slow agent runs
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB after base64 decode
 const MAX_JSON_BYTES = 35 * 1024 * 1024; // ≈ 25MB base64-inflated
+// Cap on the dock-offline buffer (unified-channel-mirror follow-up). When the
+// dock isn't holding an SSE stream open, agent replies and mirrored Telegram
+// inbounds are stashed here so they show up the next time the dock polls.
+// Oldest entries are evicted when this cap is reached.
+const MAX_BUFFERED_MESSAGES = 100;
 
 interface PendingResponse {
   res: ServerResponse;
@@ -70,6 +75,16 @@ interface PendingResponse {
   timeout: NodeJS.Timeout;
   createdAt: number;
   conversationId: string;
+}
+
+/**
+ * A message that arrived while the dock had no open SSE stream. Saved in
+ * memory until the dock fetches `/chat/pending`, which drains the buffer in
+ * one read-and-clear atomic operation.
+ */
+interface BufferedMessage {
+  text: string;
+  ts: string;
 }
 
 interface ChatRequest {
@@ -130,6 +145,10 @@ export class McChatChannel implements Channel {
   // an entry; sendMessage() shifts the oldest. Single-user usage keeps this
   // queue at depth 0 or 1 in practice.
   private pending: PendingResponse[] = [];
+  // FIFO ring buffer of messages that arrived while the dock had no open SSE
+  // stream. Drained when the dock polls `/chat/pending`. Bounded — oldest
+  // entries are evicted past MAX_BUFFERED_MESSAGES.
+  private pendingBuffer: BufferedMessage[] = [];
 
   constructor(secret: string, port: number, opts: ChannelOpts) {
     this.secret = secret;
@@ -210,8 +229,14 @@ export class McChatChannel implements Channel {
             ts: new Date().toISOString(),
             channel: 'mc-chat',
             queued: this.pending.length,
+            buffered: this.pendingBuffer.length,
           }),
         );
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/chat/pending') {
+        this.handlePending(res);
         return;
       }
 
@@ -468,12 +493,13 @@ export class McChatChannel implements Channel {
     // to the oldest pending response.
     const released = this.releasePending(null, false, text);
     if (!released) {
-      // Agent emitted a scheduled or unprompted message with no live client
-      // waiting. We can't push (no persistent socket). Log and drop — the
-      // dashboard will see it when it asks next time (memory persists).
+      // No SSE waiting — push to the dock-offline buffer so the next /chat/pending
+      // poll surfaces it. This covers both agent-reply fan-outs (no prefix) and
+      // mirrored user inbounds from other channels (e.g. "📥 [Telegram]\n…").
+      this.bufferMessage(text);
       logger.info(
-        { jid, len: text.length },
-        'mc-chat: outbound with no pending client — dropping (client polls memory)',
+        { jid, len: text.length, buffered: this.pendingBuffer.length },
+        'mc-chat: outbound with no pending client — buffered for next dock poll',
       );
       return;
     }
@@ -481,6 +507,52 @@ export class McChatChannel implements Channel {
       { jid, len: text.length, conversationId: released.conversationId },
       'mc-chat: response delivered',
     );
+  }
+
+  /**
+   * Serve `GET /chat/pending`: read-and-clear the dock-offline buffer.
+   * Returns `{ messages: BufferedMessage[] }` in arrival order. The dock
+   * polls this on mount and on a 10s interval while it's open.
+   */
+  private handlePending(res: ServerResponse): void {
+    const messages = this._drainPendingBuffer();
+    if (messages.length > 0) {
+      logger.info(
+        { count: messages.length },
+        'mc-chat: draining pending buffer to dock',
+      );
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ messages }));
+  }
+
+  /**
+   * Append a message to the dock-offline buffer, evicting the oldest entry
+   * if we'd exceed MAX_BUFFERED_MESSAGES. Insertion order is preserved so
+   * /chat/pending can return entries in arrival (chronological) order.
+   */
+  private bufferMessage(text: string): void {
+    this.pendingBuffer.push({ text, ts: new Date().toISOString() });
+    if (this.pendingBuffer.length > MAX_BUFFERED_MESSAGES) {
+      const dropped = this.pendingBuffer.shift();
+      logger.warn(
+        {
+          droppedTs: dropped?.ts,
+          bufferCap: MAX_BUFFERED_MESSAGES,
+        },
+        'mc-chat: buffer full, evicting oldest message',
+      );
+    }
+  }
+
+  /**
+   * Atomically read and clear the buffer. Returns entries in arrival order.
+   * Exposed for testing; the HTTP handler also calls this.
+   */
+  _drainPendingBuffer(): BufferedMessage[] {
+    const out = this.pendingBuffer;
+    this.pendingBuffer = [];
+    return out;
   }
 
   isConnected(): boolean {
