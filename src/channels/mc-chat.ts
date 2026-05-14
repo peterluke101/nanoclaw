@@ -445,23 +445,25 @@ export class McChatChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    if (jid !== JID) {
-      logger.warn({ jid }, 'mc-chat: sendMessage for non-mc-chat JID, ignoring');
-      return;
-    }
+    // mc-chat is a singleton: there is exactly one pending SSE queue regardless
+    // of the JID the caller addresses. The orchestrator routes mc-chat traffic
+    // via `mirrorSend(mc-chat:dashboard, …)` for fan-outs, and the agent reply
+    // via the message's `source_jid` (which may be the unified primary JID,
+    // e.g. `tg:…`, when the inbound was rewritten). In both cases delivery is
+    // to the oldest pending response.
     const released = this.releasePending(null, false, text);
     if (!released) {
       // Agent emitted a scheduled or unprompted message with no live client
       // waiting. We can't push (no persistent socket). Log and drop — the
       // dashboard will see it when it asks next time (memory persists).
       logger.info(
-        { len: text.length },
+        { jid, len: text.length },
         'mc-chat: outbound with no pending client — dropping (client polls memory)',
       );
       return;
     }
     logger.info(
-      { len: text.length, conversationId: released.conversationId },
+      { jid, len: text.length, conversationId: released.conversationId },
       'mc-chat: response delivered',
     );
   }

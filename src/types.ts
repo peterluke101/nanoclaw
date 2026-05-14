@@ -40,6 +40,12 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  /**
+   * Additional JIDs that map to this same group (unified channel mirror).
+   * Inbound on any subscriber JID is rewritten to the primary so memory unifies
+   * under one key. Outbound replies are mirrored to every JID in this list.
+   */
+  subscriberJids?: string[];
 }
 
 export interface NewMessage {
@@ -55,6 +61,13 @@ export interface NewMessage {
   reply_to_message_id?: string;
   reply_to_message_content?: string;
   reply_to_sender_name?: string;
+  /**
+   * Set by the orchestrator when an inbound JID is rewritten to its group's
+   * primary JID (unified channel mirror). Records the original arrival JID so
+   * the agent reply can be dispatched to the same channel the user used.
+   * Not persisted to the messages table.
+   */
+  source_jid?: string;
 }
 
 export interface ScheduledTask {
